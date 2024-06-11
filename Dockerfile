@@ -15,7 +15,7 @@ COPY requirements.txt /app/requirements.txt
 COPY resource /app/resource
 RUN pip install -r requirements.txt -i https://mirrors.ivolces.com/pypi/simple
 
-ARG NLTK_DATA=/app/resource/nltk_data
+ENV NLTK_DATA=/app/resource/nltk_data
 RUN python -c "from styletts2 import tts; tts.StyleTTS2()"
 
 COPY app/ .

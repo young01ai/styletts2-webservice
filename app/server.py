@@ -193,16 +193,14 @@ def api_health():
     return {"status": "ok", "version": __version__}
 
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(set_timer)])
 async def api_register(request: Request, api_request: RegRequest,
                        background_tasks: BackgroundTasks,
-                       receive_time: str = Depends(get_current_time),
-                       model_index: Union[int, None] = Depends(get_model_index)):
+                       model_index: Tuple[Union[int, None], float] = Depends(get_model_index)):
+    model_index, waiting_time = model_index
     if model_index is None:
         return JSONResponse(content={"error": "service is busy."}, status_code=503)
-    waiting_time = time.perf_counter() - receive_time
     client_infos = get_client_infos(request.client)
-    logging.info(f"@@ {get_current_time()} | {client_infos} | /register process request")
     start = time.perf_counter()
     params = api_request.model_dump()
     wav_buffer = None
@@ -224,13 +222,12 @@ async def api_register(request: Request, api_request: RegRequest,
     base64_data = base64.b64encode(binary_data).decode("utf-8")
     logging.info(f"@@ {get_current_time()} | {client_infos} | /register " \
                  f"index: {model_index}, time: {waiting_time} {inference_time}")
-    logging.info(f"@@ {get_current_time()} | {client_infos} | /register return response")
     return JSONResponse(content={"embedding": base64_data,
                                  "dtype": str(embedding.dtype),
                                  "shape": str(embedding.shape)})
 
 
-@app.post("/generate")
+@app.post("/generate", dependencies=[Depends(set_timer)])
 def api_generate(request: Request, api_request: GenRequest,
                  model_index: Tuple[Union[int, None], float] = Depends(get_model_index)):
     model_index, waiting_time = model_index
@@ -266,7 +263,6 @@ def api_generate(request: Request, api_request: GenRequest,
     return_bytes.seek(0)
     logging.info(f"@@ {get_current_time()} | {client_infos} | /generate " \
                  f"index: {model_index}, time: {waiting_time} {inference_time}")
-    logging.info(f"@@ {get_current_time()} | {client_infos} | /generate return response")
     return StreamingResponse(
         return_bytes,
         media_type=f"audio/{output_format}",
