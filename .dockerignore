@@ -1,0 +1,4 @@
+.cache
+*.whl
+!styletts2*.whl
+.git

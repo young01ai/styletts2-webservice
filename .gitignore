@@ -1,0 +1,5 @@
+.cache
+nltk_data
+*.whl
+!styletts2*.whl
+.git

@@ -1,0 +1,9 @@
+torch~=2.1.0
+torchaudio~=2.1.0
+resource/styletts2-0.1.7-py3-none-any.whl
+soundfile
+fastapi
+pydantic
+uvicorn
+pydub
+python-magic
