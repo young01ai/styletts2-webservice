@@ -1,3 +1,90 @@
+############################################################################################################
+
+import xml.etree.ElementTree as ET
+import re
+from styletts2.tts import *
+
+def ssml_to_tts(ssml):
+    root = ET.fromstring(ssml)
+    output = []
+    for elem in root.iter():
+        if elem.tag == 'speak':
+            output += [elem.text if elem.text else ""]
+        elif elem.tag == 'break':
+            time = elem.attrib['time']
+            match = re.match(r"(\d+(?:\.\d+)?)(\D+)", time)
+            if match is not None:
+                value, unit = match.groups()
+                value = float(value)
+                if unit == 's':
+                    time_ms = value * 1000
+                else:
+                    time_ms = value
+                pause_cmd = f"[pause={int(time_ms)}]"
+                output += [pause_cmd]
+        if elem.tail:
+            output += [elem.tail]
+    return output
+
+class MyStyleTTS2(StyleTTS2):
+    def ssml_inference(self,
+                       text: str,
+                       target_voice_path=None,
+                       output_wav_file=None,
+                       output_sample_rate=24000,
+                       alpha=0.3,
+                       beta=0.7,
+                       t=0.7,
+                       diffusion_steps=5,
+                       embedding_scale=1,
+                       ref_s=None,
+                       phonemize=True):
+
+        if ref_s is None:
+            if not target_voice_path or not Path(target_voice_path).exists():
+                print("Cloning default target voice...")
+                target_voice_path = cached_path(DEFAULT_TARGET_VOICE_URL)
+            ref_s = self.compute_style(target_voice_path)  # target style vector
+        else:
+            ref_s = torch.as_tensor(ref_s).to(self.device)
+
+        text_segments = ssml_to_tts(text)
+        segments = []
+        prev_s = None
+        for text_segment in text_segments:
+            match = re.match(r"^\[(\w+)=(\d+)\]$", text_segment)
+            if match is not None:
+                cmd, value = match.groups()
+                if cmd == 'pause':
+                    pause = int(value)
+                    if pause > 0:
+                        segment_output = np.zeros(int(pause * 24000 / 1000), dtype=np.float32)
+                        segments.append(segment_output)
+                    continue
+            # Address cut-off sentence issue due to langchain text splitter
+            if text_segment[-1] != '.':
+                text_segment += ', '
+            segment_output, prev_s = self.inference_segment(text_segment,
+                                                            prev_s,
+                                                            ref_s,
+                                                            alpha=alpha,
+                                                            beta=beta,
+                                                            t=t,
+                                                            diffusion_steps=diffusion_steps,
+                                                            embedding_scale=embedding_scale,
+                                                            phonemize=phonemize)
+            segments.append(segment_output)
+        output = np.concatenate(segments)
+
+        torch.cuda.empty_cache()  # NOTE: This is a temporary fix for CUDA memory leak
+        if output_sample_rate != 24000:
+            output = librosa.resample(output, orig_sr=24000, target_sr=output_sample_rate)
+        if output_wav_file:
+            scipy.io.wavfile.write(output_wav_file, rate=output_sample_rate, data=output)
+        return output
+
+############################################################################################################
+
 from __version__ import __version__
 
 import time
@@ -10,7 +97,7 @@ import tempfile
 import numpy as np
 from datetime import datetime
 from typing import Union, Tuple, Annotated
-from styletts2 import tts
+# from styletts2 import tts
 from pydub import AudioSegment
 
 from pydantic import BaseModel, Field
@@ -30,14 +117,14 @@ host = str(os.getenv("SERVICE_HOST", "0.0.0.0"))
 port = int(os.getenv("SERVICE_PORT", "7860"))
 workers = int(os.getenv("NUM_WORKERS", "1"))
 
-MAX_MODEL_INSTANCES = int(os.getenv("MAX_MODEL_INSTANCES", "4"))
+MAX_MODEL_INSTANCES = int(os.getenv("MAX_MODEL_INSTANCES", "2"))
 QUEUE_TIMEOUT_SEC = float(os.getenv("QUEUE_TIMEOUT_SEC", "90.0"))
 
 warmup_text = "This is an inference API for StyleTTS2. It is now warming up..."
 
 def load_model(chkpt_path=None, config_path=None):
     load_start = time.perf_counter()
-    model = tts.StyleTTS2(chkpt_path, config_path)
+    model = MyStyleTTS2(chkpt_path, config_path)
     model.inference(warmup_text)
     logging.info(f"Model loaded in {time.perf_counter() - load_start} seconds.")
     return model
@@ -211,10 +298,7 @@ async def api_register(request: Request, api_request: RegRequest,
     wav_buffer = process_audio(api_request.voice)
     params["target_voice_path"] = wav_buffer
     del params["voice"]
-    try:
-        embedding = model_instances[model_index].compute_style(**params).cpu().numpy()
-    except Exception as e:
-        return JSONResponse(content={"service error": str(e)}, status_code=500)
+    embedding = model_instances[model_index].compute_style(**params).cpu().numpy()
     model_queue.put_nowait(model_index)  # return the model index to the queue
     inference_time = time.perf_counter() - start
     background_tasks.add_task(os.remove, wav_buffer)
@@ -247,12 +331,18 @@ def api_generate(request: Request, api_request: GenRequest,
     del params["voice"]
     wav_bytes = io.BytesIO()
     try:
-        model_instances[model_index].inference(
-            **params,
-            output_wav_file=wav_bytes,
-        )
+        if params["text"].startswith("<speak>") and params["text"].endswith("</speak>"):
+            model_instances[model_index].ssml_inference(
+                **params,
+                output_wav_file=wav_bytes,
+            )
+        else:
+            model_instances[model_index].inference(
+                **params,
+                output_wav_file=wav_bytes,
+            )
     except Exception as e:
-        return JSONResponse(content={"service error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
     model_queue.put_nowait(model_index)  # return the model index to the queue
     inference_time = time.perf_counter() - start
     audio, duration_seconds = get_wav_length_from_bytesio(wav_bytes)
@@ -293,12 +383,18 @@ def api_invoke(request: Request, api_request: TTSRequest,
     register_time = time.perf_counter() - start
     wav_bytes = io.BytesIO()
     try:
-        model_instances[model_index].inference(
-            **params,
-            output_wav_file=wav_bytes,
-        )
+        if params["text"].startswith("<speak>") and params["text"].endswith("</speak>"):
+            model_instances[model_index].ssml_inference(
+                **params,
+                output_wav_file=wav_bytes,
+            )
+        else:
+            model_instances[model_index].inference(
+                **params,
+                output_wav_file=wav_bytes,
+            )
     except Exception as e:
-        return JSONResponse(content={"service error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
     generate_time = time.perf_counter() - start - register_time
     inference_time = register_time + generate_time
     model_queue.put_nowait(model_index)  # return the model index to the queue
